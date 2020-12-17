@@ -352,8 +352,8 @@ def main(configfile, logfile, lag, interval):
                     click.secho(' {}-{} {}'.format(channel_min, channel_max, len(usageDataPoints)),
                                 fg='red', bold=True, nl=False)
                     click.echo(']', nl=False)
-                    if S.failed_run > 2:  # if we failed 3 times in a row, abort recovery and continue
-                        logger.error('3 consecutive failed pull, resetting to success')
+                    if S.failed_run > 3:  # if we failed 3 times in a row, abort recovery and continue
+                        logger.error('3 consecutive incomplete retry, aborting retry')
                         S.failed_run = 0  # revert to success, so we wrote whatever we had
                     else:
                         logger.info('run %d failed, not enough data points')
@@ -378,9 +378,18 @@ def main(configfile, logfile, lag, interval):
                 logger.info('run %d successful.', S.run_count)
                 S.failed_run = 0
             except Exception as e:
-                S.failed_run += 1
+                # This is likely some kind of HTTP exception. We'll just
+                # keep trying every 20s until the service is restored.
+                #
+                # We do need to reset the failure counter, since we want a
+                # full pull after service comes back (from when failure
+                # started, and also retry IF that pull didn't yield complete
+                # data). Not resetting the counter would result in no-retry
+                # if the first pull after service restore did not yield all
+                # the data points, which does happen occasionally.
+                S.failed_run = 1
                 S.total_failed_run += 1
-                logger.info('run %d exception: %s', S.run_count, e)
+                logger.error('run %d exception: %s', S.run_count, e)
                 click.secho(' Exception @ {}'.format(
                     datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')), bold=True, fg='red', nl=False)
                 click.echo(']', nl=False)
