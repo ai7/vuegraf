@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 
 import os
+import sys
+
+# add ./py_lib to import path if exist
+if os.path.exists(os.path.join(sys.path[0], 'py_lib')):
+    sys.path.append(os.path.join(sys.path[0], 'py_lib'))
+
 import datetime
 import json
 import signal
 import tempfile
+import yaml
 import logging
 from logging.handlers import RotatingFileHandler
 from threading import Event
@@ -16,7 +23,7 @@ from pyemvue.device import VuewDeviceChannelUsage
 from pyemvue.enums import Scale, Unit, TotalTimeFrame, TotalUnit
 
 
-LOG_FILE = 'vuegraf.log'  # log file created in temp
+LOG_FILE = 'vuegraf.log'  # default log file in temp
 DEVICE_CHANNEL = '1,2,3'  # main/parent device
 
 INTERVAL_SECS = 60        # delay between each pulling of usage data from emporia
@@ -33,9 +40,11 @@ SUCCESS_THRESHOLD2 = 10  # min should be this close to max channel points
 # have incomplete data for the pull duration.
 LAG_SECS = 20
 
+KEY_FILE = 'vue_keys.json'  # default credential file
+
 logger = logging.getLogger()
 pauseEvent = Event()
-running = True
+running = False
 
 
 def console_info(message, value, color):
@@ -65,8 +74,12 @@ def setup_logging(logfile):
 def handleExit(signum, frame):
     global running
     logger.error('Caught exit signal')
-    running = False
-    pauseEvent.set()
+    if running:
+        running = False
+        pauseEvent.set()
+    else:
+        logger.info('not in run loop, exiting directly ...')
+        exit(1)
 
 
 def populateDevices(account):
@@ -192,9 +205,132 @@ class Stat:
         print('total data points recorded: {:,}'.format(self.total_data_points))
 
 
+class Config:
+    """Wrapper for our configurations, supports both JSON/YAML configs"""
+    def __init__(self, configfile):
+        self._config = {}
+        if configfile.lower().endswith(('.yaml', '.yml')):
+            self._config = Config.read_yaml(configfile)
+        else:
+            self._config = Config.read_json(configfile)
+
+    def __getitem__(self, key):  # override the [] operator on class
+        # type: (str) -> dict
+        return self._config[key]
+
+    @staticmethod
+    def read_yaml(filename):
+        # type: (str) -> dict
+        with open(filename) as fp:
+            return yaml.load(fp, Loader=yaml.FullLoader)
+
+    @staticmethod
+    def read_json(filename):
+        # type: (str) -> dict
+        with open(filename) as fp:
+            return json.load(fp)
+
+
+class Database:
+    """Wrapper for InfluxDB operations"""
+    def __init__(self, config):
+        self._config = config['influxDb']
+        self._influx = None
+
+    @property
+    def influx(self):
+        return self._influx
+
+    def login(self):
+        # type: () -> InfluxDBClient
+        """Log into influxdb"""
+        console_info('logging into influxDB: ', self._config['host'], 'green')
+        # Only authenticate to ingress if 'user' entry was provided in config
+        if 'user' in self._config:
+            logger.info('connecting to influxDB with user/password')
+            self._influx = InfluxDBClient(host=self._config['host'], port=self._config['port'],
+                                          username=self._config['user'], password=self._config['pass'],
+                                          database=self._config['database'])
+        else:
+            logger.info('connecting to influxDb')
+            self._influx = InfluxDBClient(host=self._config['host'], port=self._config['port'],
+                                          database=self._config['database'])
+        return self._influx
+
+    def create_database(self):
+        # type: () -> InfluxDBClient
+        console_info('opening database: ', self._config['database'], 'yellow')
+        logger.info('creating database: %s', self._config['database'])
+        try:
+            self._influx.create_database(self._config['database'])
+            if self._config['reset']:
+                click.echo('Resetting database')
+                self._influx.delete_series(measurement='energy_usage')
+            return self._influx
+        except Exception as e:
+            logger.error('failed to login: %s', e)
+            console_info('Error: ', e, 'red')
+            exit(1)  # just exit if we can't connect to influxdb
+
+
+class Account:
+    """Class for one Emporia account and devices"""
+    def __init__(self, account):
+        # type: (object, dict) -> None
+        self._account = account  # config dict
+        self._name = account['name']
+        self._email = account['email']
+        self._password = account.get('password')
+        self._token_file = account.get('token_file', KEY_FILE)  # optional config
+        self._token_file_data = {}
+        if os.path.exists(self._token_file):
+            self._token_file_data = Config.read_json(self._token_file)
+        self._vue = PyEmVue()
+        self._account['vue'] = self._vue  # todo: refactor this later
+
+    def __getitem__(self, key):  # override [] operator on class for get
+        return self._account[key]
+
+    def __setitem__(self, key, value):  # override [] operator for set
+        self._account[key] = value
+
+    @property
+    def account(self):  # config dict for compatibility with code
+        return self._account
+
+    def login(self):
+        console_info('logging into Emporia for: ', self._name, 'green')
+        try:
+            if self._token_file_data:
+                # if token file exist, we've already logged in before, use token
+                console_info('  method [token]: ', self._token_file, 'green')
+                logger.info("logging into Emporia for account: %s [token]", self._name)
+                self._vue.login(id_token=self._token_file_data['idToken'],
+                                access_token=self._token_file_data['accessToken'],
+                                refresh_token=self._token_file_data['refreshToken'],
+                                token_storage_file=self._token_file)
+            else:
+                # otherwise use username/password, and prompt for pwd if necessary
+                console_info('  method [password]: ', self._email, 'green')
+                if not self._password:
+                    self._password = click.prompt("  Enter password: ", hide_input=True)
+                logger.info("logging into Emporia for account: %s [password]", self._name)
+                self._vue.login(username=self._email, password=self._password,
+                                token_storage_file=self._token_file)
+        except Exception as e:
+            logger.error('failed to login: %s', e)
+            console_info('Error: ', e, 'red')
+            exit(1)  # just exit if we can't connect to influxdb
+
+    def populate_devices(self):
+        click.echo('discovering devices ... ', nl=False)
+        logger.info("populating devices")
+        populateDevices(self._account)
+
+
 @click.command()
-@click.option('-c', '--config', 'configfile', help='config file [vuegraf.json]',
-              default='vuegraf.json', type=click.Path(exists=True))
+@click.option('-c', '--config', 'configfile', help='config file [vuegraf.yaml]',
+              default='vuegraf.yaml', type=click.Path(exists=True))
 @click.option('-l', '--log', 'logfile', metavar='PATH', help='log file [$TMP/vuegraf.log]')
 @click.option('--lag', metavar='SECONDS', default=LAG_SECS, help='lag time [20s]')
 @click.option('--interval', metavar='SECONDS', default=INTERVAL_SECS, help='pull/sleep interval [60s]')
@@ -206,42 +342,33 @@ def main(configfile, logfile, lag, interval):
     console_info('pulling interval: ', interval, 'green')
     console_info('lag seconds: ', lag, 'green')
 
-    config = {}
-    with open(configfile) as configFile:
-        logger.info('loading config file %s', configfile)
-        config = json.load(configFile)
+    config = Config(configfile)  # object, can be accessed like dict
 
-    # Only authenticate to ingress if 'user' entry was provided in config
-    console_info('logging into influxDB: ', config['influxDb']['host'], 'green')
-    if 'user' in config['influxDb']:
-        logger.info('connecting to influxDB with user/password')
-        influx = InfluxDBClient(host=config['influxDb']['host'], port=config['influxDb']['port'],
-                                username=config['influxDb']['user'], password=config['influxDb']['pass'],
-                                database=config['influxDb']['database'])
-    else:
-        logger.info('connecting to influxDb')
-        influx = InfluxDBClient(host=config['influxDb']['host'], port=config['influxDb']['port'],
-                                database=config['influxDb']['database'])
+    db = Database(config)
+    db.login()  # log into influxDB
+    db.create_database()  # open/create/reset or database if necessary
 
-    console_info('opening database: ', config['influxDb']['database'], 'yellow')
-    logger.info('creating database: %s', config['influxDb']['database'])
-    influx.create_database(config['influxDb']['database'])
+    # log into emporia accounts
+    accounts = []
+    for acct_config in config['accounts']:
+        account = Account(acct_config)
+        account.login()
+        account.populate_devices()
+        accounts.append(account)
+    # exit(0)  # for testing above logic
+
+    S = Stat()
+    running = True
 
     signal.signal(signal.SIGINT, handleExit)
     signal.signal(signal.SIGHUP, handleExit)
-
-    if config['influxDb']['reset']:
-        click.echo('Resetting database')
-        influx.delete_series(measurement='energy_usage')
-
-    S = Stat()
 
     while running:
         S.new_run()
         logger.info('starting run --> %d <-- [uptime: %s]', S.run_count,  S.run_start_time - S.uptime_start)
 
         # todo: test more than one account to ensure console output looks reasonable
-        for account in config["accounts"]:
+        for account in accounts:
             # compute polling ending time, which LAG_SECS before current time
             tmpEndingTime = datetime.datetime.utcnow() - datetime.timedelta(seconds=lag)
             # align timestamp to the second, this results in the correct number of points for
@@ -249,22 +376,12 @@ def main(configfile, logfile, lag, interval):
             # it also allows us to just use end time as the next start time in next round.
             tmpEndingTime = tmpEndingTime.replace(microsecond=0)
 
-            if 'vue' not in account:  # first iteration, create objects
-                console_info('logging into Emporia for: ', account['name'], 'green')
-                logger.info("logging into Emporia for account: %s", account['name'])
-                account['vue'] = PyEmVue()
-                account['vue'].login(username=account['email'], password=account['password'])
-
-                click.echo('discovering devices ... ', nl=False)
-                logger.info("populating devices")
-                populateDevices(account)
-
+            if S.run_count == 1:   # first iteration
                 account['end'] = tmpEndingTime
-
                 start = account['end'] - datetime.timedelta(seconds=interval)  # start with 60s prior
 
-                result = influx.query('select last(usage), time from energy_usage where account_name = \'{}\''
-                                      .format(account['name']))
+                result = db.influx.query('select last(usage), time from energy_usage where account_name = \'{}\''
+                                         .format(account['name']))
                 if len(result) > 0:
                     # timestamp from db may have microseconds like '2020-12-16T06:57:28.985109Z'
                     # from previous runs before we aligned time to seconds. So we want to chop
@@ -272,7 +389,13 @@ def main(configfile, logfile, lag, interval):
                     timeStr = next(result.get_points())['time'][:19] + 'Z'
                     tmpStartingTime = datetime.datetime.strptime(timeStr, '%Y-%m-%dT%H:%M:%SZ')
                     if tmpStartingTime > start:  # if already have data after our computed start
+                        console_info('resuming from last db timestamp: ', timeStr, 'green')
                         start = tmpStartingTime  # use the last data timestamp as new start
+                    else:
+                        # todo: if within X minute, resume from there?
+                        console_info('last db timestamp: ',
+                                     '{} [{} ago]'.format(timeStr, start - tmpStartingTime),
+                                     'green')
             else:
                 if not S.failed_run:
                     # start = account['end'] + datetime.timedelta(seconds=1)
@@ -313,7 +436,7 @@ def main(configfile, logfile, lag, interval):
                 channel_min = 65536  # some large number
                 data_channels = 0  # how many channels have some data
                 for chan in channels:
-                    chanName = lookupChannelName(account, chan)
+                    chanName = lookupChannelName(account.account, chan)
 
                     # get the actual usage for this channel over the time interval
                     # usage is simply a list of floats, each representing each second
@@ -370,7 +493,7 @@ def main(configfile, logfile, lag, interval):
                     click.echo(']', nl=False)
 
                 logger.info('writing %d data points to database.', len(usageDataPoints))
-                influx.write_points(usageDataPoints)
+                db.influx.write_points(usageDataPoints)
                 S.total_data_points += len(usageDataPoints)
 
                 # info('Submitted datapoints to database; account="{}"; points={}'.format(account['name'],

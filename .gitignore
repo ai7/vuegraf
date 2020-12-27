@@ -1,1 +1,11 @@
+# config files with credentials should never be checked in.
 vuegraf.json
+vuegraf.yaml
+
+# auth token file
+vue_keys.json
+
+# pycharm/intellij project files
+.idea
+
+build
